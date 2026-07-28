@@ -37,18 +37,25 @@ class EEController:
     and a gripper opening; convert to joint targets with IK each control step."""
 
     def __init__(self, env, use_orientation=True, workspace=None,
-                 max_ee_speed=0.02):
+                 max_ee_speed=None):
         self.env = env
         self.ik = DifferentialIK(env.model, env.ids, max_step=0.12)
-        self.use_orientation = use_orientation
-        # Reasonable reachable workspace box (metres) for clamping the target.
-        self.workspace = workspace or np.array([[0.20, 0.60],
-                                                [-0.35, 0.35],
-                                                [0.02, 0.55]])
+        info = getattr(env, "info", {})
+        # A 5-DOF arm cannot achieve an arbitrary orientation, so it servos
+        # position only.
+        self.use_orientation = use_orientation and getattr(env, "dof", 6) >= 6
+        # Workspace box and slew rate both scale with the arm: the YAM-tuned
+        # box excludes an SO-ARM100's entire reachable set.
+        if workspace is None:
+            workspace = info.get("workspace", np.array([[0.20, 0.60],
+                                                        [-0.35, 0.35],
+                                                        [0.02, 0.55]]))
+        self.workspace = np.asarray(workspace, dtype=np.float64)
+        self.down_quat = np.asarray(info.get("down_quat", DOWN_QUAT))
         # Cartesian slew rate: the commanded EE point moves toward the goal by at
         # most this many metres per control step. Keeps motions smooth so the
         # position controllers never whip the arm (which flings grasped objects).
-        self.max_ee_speed = max_ee_speed
+        self.max_ee_speed = max_ee_speed or 0.025 * info.get("reach", 0.79)
         self.reset()
 
     def reset(self):
@@ -76,7 +83,7 @@ class EEController:
 
     def action(self):
         self._slew()
-        quat = DOWN_QUAT if self.use_orientation else None
+        quat = self.down_quat if self.use_orientation else None
         arm = self.ik.solve(self.env.robot.arm_qpos(), self.target_pos,
                             target_quat=quat, full_qpos=self.env.data.qpos.copy())
         return np.concatenate([arm, [self.gripper]]).astype(np.float32)
@@ -95,6 +102,12 @@ class scripted_expert:
         self.timer = 0
         self.done = False
         self.pick_xy = None  # snapshotted at grasp so transport doesn't chase drift
+        # Waypoint heights and tolerances are ratios of reach, calibrated so a
+        # 0.79 m YAM keeps its original hand-tuned values.
+        info = getattr(env, "info", {})
+        self.s = info.get("reach", 0.79) / 0.79
+        self.fo = info.get("fingertip_offset", FINGERTIP_OFFSET)
+        self.cube_half = getattr(env, "cube_half", 0.025)
 
     def _goto(self, pos, gripper, tol=0.02, max_t=40):
         self.ctl.set_target(pos)
@@ -118,28 +131,30 @@ class scripted_expert:
         cube = env.object_pos()  # only used pre-grasp (phases 0-1)
         pre = self.pick_xy if self.pick_xy is not None else cube[:2]
 
-        above_cube = np.array([cube[0], cube[1], cube[2] + 0.16])
-        grasp = np.array([cube[0], cube[1], cube[2] + FINGERTIP_OFFSET])
+        s, fo = self.s, self.fo
+        above_cube = np.array([cube[0], cube[1], cube[2] + 0.16 * s])
+        grasp = np.array([cube[0], cube[1], cube[2] + fo])
         # Post-grasp waypoints are FIXED (snapshotted xy), so a little cube drift
         # can't turn into a runaway target-chasing feedback loop.
-        lift = np.array([pre[0], pre[1], 0.18])
-        above_tgt = np.array([target[0], target[1], 0.18])
-        place = np.array([target[0], target[1], 0.025 + FINGERTIP_OFFSET + 0.008])
+        lift = np.array([pre[0], pre[1], 0.18 * s])
+        above_tgt = np.array([target[0], target[1], 0.18 * s])
+        place = np.array([target[0], target[1],
+                          self.cube_half + fo + 0.008 * s])
 
-        if self.phase == 0 and self._goto(above_cube, 1.0):
+        if self.phase == 0 and self._goto(above_cube, 1.0, tol=0.02 * s):
             self._advance()
-        elif self.phase == 1 and self._goto(grasp, 1.0, tol=0.012, max_t=60):
+        elif self.phase == 1 and self._goto(grasp, 1.0, tol=0.012 * s, max_t=60):
             self.pick_xy = self.env.robot.ee_pose()[0][:2].copy()
             self._advance()
         elif self.phase == 2:  # close gripper (hold in place)
             self._goto(grasp, 0.0, tol=0.0, max_t=15)
             if self.timer > 15:
                 self._advance()
-        elif self.phase == 3 and self._goto(lift, 0.0, max_t=45):
+        elif self.phase == 3 and self._goto(lift, 0.0, tol=0.02 * s, max_t=45):
             self._advance()
-        elif self.phase == 4 and self._goto(above_tgt, 0.0, max_t=60):
+        elif self.phase == 4 and self._goto(above_tgt, 0.0, tol=0.02 * s, max_t=60):
             self._advance()
-        elif self.phase == 5 and self._goto(place, 0.0, tol=0.025, max_t=60):
+        elif self.phase == 5 and self._goto(place, 0.0, tol=0.025 * s, max_t=60):
             self._advance()
         elif self.phase == 6:  # open gripper
             self._goto(place, 1.0, tol=0.0, max_t=15)

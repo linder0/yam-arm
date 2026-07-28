@@ -70,15 +70,21 @@ class SimYamRobot(YamRobot):
 
     def __init__(self, task="pick_cube", control_dt=0.05,
                  camera_names=None, cam_height=128, cam_width=128,
-                 render_cameras=True):
+                 render_cameras=True, extra_objects=None, embodiment="yam"):
         import mujoco
+        from . import embodiments as E
+        from . import scene as S
         self.mujoco = mujoco
         self.task = task
-        self.model = M.load_model(task)
+        self.emb = E.REGISTRY[embodiment] if isinstance(embodiment, str) \
+            else embodiment
+        self.model, self.info = S.build(self.emb, task=task,
+                                        extra_objects=list(extra_objects or []))
         self.data = mujoco.MjData(self.model)
-        self.ids = M.Ids(self.model, task)
+        self.ids = M.Ids(self.model, task, self.emb)
         self.control_dt = control_dt
         self._n_substeps = max(1, round(control_dt / self.model.opt.timestep))
+        self.num_arm_joints = self.emb.dof
 
         self.camera_names = list(camera_names or M.DEFAULT_CAMERAS)
         self._render_cameras = render_cameras
@@ -87,9 +93,26 @@ class SimYamRobot(YamRobot):
             self._rig = M.CameraRig(self.model, self.camera_names,
                                     height=cam_height, width=cam_width)
 
-        # Gripper normalization: left_finger qpos at fully-open ctrl.
-        self._gripper_open_qpos = 0.0376
+        # Gripper ctrl endpoints are measured per robot (units differ: metres,
+        # radians, or 0-255), so the normalized [0, 1] interface holds anywhere.
+        self._grip_closed, self._grip_open = self.info["gripper_ctrl"]
+        self._home_arm = self.info["home_arm_qpos"]
+        self._gripper_open_qpos = self._measure_open_finger_qpos()
         self.reset_home()
+
+    def _measure_open_finger_qpos(self):
+        """Finger-joint reading at the fully-open ctrl, used to normalize
+        gripper feedback. YAM's value was the hardcoded 0.0376."""
+        if self.ids.left_finger_qpos_adr < 0:
+            return 1.0
+        d = self.mujoco.MjData(self.model)
+        d.qpos[:] = self.model.qpos0
+        self.mujoco.mj_forward(self.model, d)
+        d.ctrl[self.ids.gripper_actuator] = self._grip_open
+        for _ in range(300):
+            self.mujoco.mj_step(self.model, d)
+        v = float(d.qpos[self.ids.left_finger_qpos_adr])
+        return v if abs(v) > 1e-6 else 1.0
 
     # -- state ---------------------------------------------------------------
     def arm_qpos(self):
@@ -99,6 +122,8 @@ class SimYamRobot(YamRobot):
         return self.data.qvel[self.ids.arm_dof_adr].astype(np.float32)
 
     def gripper_pos(self):
+        if self.ids.left_finger_qpos_adr < 0:
+            return 1.0
         lf = float(self.data.qpos[self.ids.left_finger_qpos_adr])
         return float(np.clip(lf / self._gripper_open_qpos, 0.0, 1.0))
 
@@ -117,11 +142,11 @@ class SimYamRobot(YamRobot):
     # -- control -------------------------------------------------------------
     def command(self, arm_qpos_target, gripper):
         arm_qpos_target = np.asarray(arm_qpos_target, dtype=np.float64).reshape(-1)
-        for a, adr in zip(self.ids.arm_actuators, range(6)):
-            self.data.ctrl[a] = arm_qpos_target[adr]
+        for i, a in enumerate(self.ids.arm_actuators):
+            self.data.ctrl[a] = arm_qpos_target[i]
         g = float(np.clip(gripper, 0.0, 1.0))
         self.data.ctrl[self.ids.gripper_actuator] = (
-            M.GRIPPER_CLOSE_CTRL + g * (M.GRIPPER_OPEN_CTRL - M.GRIPPER_CLOSE_CTRL))
+            self._grip_closed + g * (self._grip_open - self._grip_closed))
 
     def hold_current(self):
         """Set the ctrl targets to the current pose (used right after a reset so
@@ -134,7 +159,7 @@ class SimYamRobot(YamRobot):
 
     # -- sim-only helpers ----------------------------------------------------
     def reset_home(self):
-        self.data.qpos[:] = M.key_qpos_home(self.model, self.ids)
+        self.data.qpos[:] = M.key_qpos_home(self.model, self.ids, self._home_arm)
         self.data.qvel[:] = 0.0
         self.mujoco.mj_forward(self.model, self.data)
         self.hold_current()

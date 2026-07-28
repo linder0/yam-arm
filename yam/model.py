@@ -70,36 +70,85 @@ def task_xml_path(task):
     return os.path.join(ASSETS_DIR, TASKS[task]["xml"])
 
 
-def load_model(task="pick_cube"):
-    """Compile and return the MjModel for a task scene."""
+# -- dynamic scene composition (agent-spawned objects) ------------------------
+# Extra free bodies injected into a task scene at runtime (the spawn_object
+# skill). Each spec: {name, shape, size (per-shape MuJoCo halfsizes), pos
+# (xyz), rgba, mass}. Free joints append to qpos in worldbody order, so a
+# scene extended with more objects keeps the base layout as a prefix --
+# that's what lets a rebuild preserve the poses of everything already there.
+SPAWN_SHAPES = ("box", "sphere", "cylinder")
+
+
+def _object_body_xml(o):
+    size = " ".join(f"{float(s):g}" for s in o["size"])
+    rgba = " ".join(f"{float(c):g}" for c in o["rgba"])
+    x, y, z = (float(v) for v in o["pos"])
+    return (
+        f'    <body name="{o["name"]}" pos="{x:g} {y:g} {z:g}">\n'
+        f'      <freejoint name="{o["name"]}_free"/>\n'
+        f'      <geom name="{o["name"]}_geom" type="{o["shape"]}" '
+        f'size="{size}" rgba="{rgba}" mass="{float(o["mass"]):g}" '
+        f'condim="4" friction="1.0 0.05 0.01" contype="1" conaffinity="1"/>\n'
+        f"    </body>\n")
+
+
+def compose_scene_xml(task, extra_objects):
+    """Write the task scene + spawned bodies to ``_live_<task>.xml`` (next to
+    the base XML so the arm include/meshdir keep resolving); returns the path."""
+    with open(task_xml_path(task)) as f:
+        xml = f.read()
+    bodies = "".join(_object_body_xml(o) for o in extra_objects)
+    xml = xml.replace("</worldbody>", bodies + "  </worldbody>")
+    path = os.path.join(ASSETS_DIR, f"_live_{task}.xml")
+    with open(path, "w") as f:
+        f.write(xml)
+    return path
+
+
+def load_model(task="pick_cube", extra_objects=None):
+    """Compile and return the MjModel for a task scene (plus any spawned
+    objects)."""
+    if extra_objects:
+        return mujoco.MjModel.from_xml_path(
+            compose_scene_xml(task, extra_objects))
     return mujoco.MjModel.from_xml_path(task_xml_path(task))
 
 
 class Ids:
     """Resolved MuJoCo ids for the handles env/robot/ik need. Built once per
-    model so hot loops index by int, never by name."""
+    model so hot loops index by int, never by name.
 
-    def __init__(self, model, task):
+    ``emb`` supplies the per-robot naming (see ``yam.embodiments``); it defaults
+    to YAM, for which these are the module constants above.
+    """
+
+    def __init__(self, model, task, emb=None):
+        from . import embodiments as E
         self.task = task
         self.spec = TASKS[task]
+        self.emb = emb = emb or E.REGISTRY["yam"]
 
         def jid(n): return mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, n)
         def aid(n): return mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, n)
         def sid(n): return mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, n)
         def bid(n): return mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, n)
 
-        self.arm_joints = [jid(n) for n in ARM_JOINTS]
-        self.finger_joints = [jid(n) for n in FINGER_JOINTS]
+        self.arm_joints = [jid(n) for n in emb.arm_joints]
+        if min(self.arm_joints) < 0:
+            raise ValueError(f"{emb.key}: unresolved arm joints {emb.arm_joints}")
         # qpos/qvel addresses for the arm joints (all hinge => 1 dof each).
         self.arm_qpos_adr = np.array([model.jnt_qposadr[j] for j in self.arm_joints])
         self.arm_dof_adr = np.array([model.jnt_dofadr[j] for j in self.arm_joints])
-        self.left_finger_qpos_adr = model.jnt_qposadr[jid("left_finger")]
 
-        self.arm_actuators = [aid(n) for n in ARM_ACTUATORS]
-        self.gripper_actuator = aid(GRIPPER_ACTUATOR)
+        self.finger_joints = [jid(n) for n in emb.finger_bodies or ()]
+        finger = jid(emb.finger_joint) if emb.finger_joint else -1
+        self.left_finger_qpos_adr = model.jnt_qposadr[finger] if finger >= 0 else -1
 
-        self.grasp_site = sid(GRASP_SITE)
-        self.tcp_site = sid(TCP_SITE)
+        self.arm_actuators = [aid(n) for n in emb.arm_actuators]
+        self.gripper_actuator = aid(emb.gripper_actuator)
+
+        self.grasp_site = sid(E.grasp_site_name(emb))
+        self.tcp_site = sid(TCP_SITE)  # YAM-only; -1 elsewhere
 
         self.object_body = bid(self.spec["object_body"]) if self.spec["has_object"] else -1
         if self.spec["has_object"]:
@@ -113,11 +162,15 @@ class Ids:
         self.target_mocap = int(model.body_mocapid[self.target_body])
 
 
-def key_qpos_home(model, ids):
-    """A full-length home qpos for a task model: arm at HOME_QPOS_ARM, gripper
+def key_qpos_home(model, ids, home_arm=None):
+    """A full-length home qpos for a task model: arm at its home pose, gripper
     open, object (if any) at its scene default."""
+    from . import embodiments as E
     qpos = np.array(model.qpos0, dtype=np.float64)
-    qpos[ids.arm_qpos_adr] = HOME_QPOS_ARM
+    if home_arm is None:
+        home_arm = E.home_arm_qpos(getattr(ids, "emb", None) or E.REGISTRY["yam"],
+                                   model)
+    qpos[ids.arm_qpos_adr] = home_arm
     return qpos
 
 
@@ -167,6 +220,53 @@ _GEOM_TYPE = {
 }
 
 
+def _mesh_triangles(model, mid):
+    """Triangles of a compiled mesh, in the mesh's (recentered) frame."""
+    va, nv = model.mesh_vertadr[mid], model.mesh_vertnum[mid]
+    fa, nf = model.mesh_faceadr[mid], model.mesh_facenum[mid]
+    verts = model.mesh_vert[va:va + nv]
+    faces = model.mesh_face[fa:fa + nf]
+    return verts[faces]                      # (nfaces, 3, 3)
+
+
+def write_binary_stl(path, tris):
+    import struct
+    n = len(tris)
+    v0, v1, v2 = tris[:, 0], tris[:, 1], tris[:, 2]
+    nrm = np.cross(v1 - v0, v2 - v0)
+    ln = np.linalg.norm(nrm, axis=1, keepdims=True)
+    nrm = nrm / np.where(ln == 0, 1.0, ln)
+    rec = np.zeros(n, dtype=[("d", "<f4", 12), ("attr", "<u2")])
+    rec["d"][:, 0:3] = nrm
+    rec["d"][:, 3:6] = v0
+    rec["d"][:, 6:9] = v1
+    rec["d"][:, 9:12] = v2
+    with open(path, "wb") as f:
+        f.write(b"\0" * 80)
+        f.write(struct.pack("<I", n))
+        f.write(rec.tobytes())
+
+
+def export_model_meshes(model, out_dir, prefix=""):
+    """Write every mesh in a compiled model as a binary STL.
+
+    Emitting geometry from the compiled model rather than copying the vendor
+    files is what makes the viewer embodiment-agnostic: a UR5e ships only
+    ``.obj``, which the browser's STLLoader cannot read, and mesh names collide
+    across arms. Compiled vertices are already scaled and in the recentered
+    frame, so the manifest for these must omit ``mesh_pos``/``mesh_quat`` --
+    the viewer's un-recentering correction would otherwise double-apply.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    files = {}
+    for mid in range(model.nmesh):
+        name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_MESH, mid) or f"mesh{mid}"
+        fname = f"{prefix}{name}.stl".replace("/", "_")
+        write_binary_stl(os.path.join(out_dir, fname), _mesh_triangles(model, mid))
+        files[mid] = fname
+    return files
+
+
 def _geom_rgba(model, gid):
     matid = int(model.geom_matid[gid])
     if matid >= 0:
@@ -174,10 +274,22 @@ def _geom_rgba(model, gid):
     return [float(x) for x in model.geom_rgba[gid]]
 
 
-def scene_manifest(model, task, include_groups=(0, 1, 2)):
+def _strip_prefixes(name, prefixes):
+    for p in prefixes:
+        if name.startswith(p):
+            return name[len(p):]
+    return name
+
+
+def scene_manifest(model, task, include_groups=(0, 1, 2), description=None,
+                   mesh_prefixes=(), mesh_files=None):
     """A JSON-able description of the renderable scene: bodies (in id order) and
     their geoms with local transforms. Visual geoms live in groups 0-2; the
-    collision groups (3) are skipped by default."""
+    collision groups (3) are skipped by default.
+
+    ``mesh_prefixes`` lets attached models (e.g. the two-arm build, whose meshes
+    are named ``left_model2``/``right_model2``) map back to the on-disk STL
+    (``model2.stl``) so meshes are shared instead of duplicated per arm."""
     bodies = []
     for b in range(model.nbody):
         name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, b) or f"body{b}"
@@ -203,15 +315,31 @@ def scene_manifest(model, task, include_groups=(0, 1, 2)):
         }
         if gtype == "mesh":
             mid = int(model.geom_dataid[g])
+            if mesh_files is not None:
+                # Geometry emitted straight from the compiled model: already
+                # scaled and recentered, so no correction fields.
+                entry["mesh"] = mesh_files[mid]
+                geoms.append(entry)
+                meshes_used.add(mesh_files[mid][:-len(".stl")])
+                continue
             mesh_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_MESH, mid)
-            entry["mesh"] = f"{mesh_name}.stl"
+            mesh_file = _strip_prefixes(mesh_name, mesh_prefixes)
+            entry["mesh"] = f"{mesh_file}.stl"
             entry["mesh_scale"] = [float(x) for x in model.mesh_scale[mid]]
-            meshes_used.add(mesh_name)
+            # MuJoCo recenters mesh vertices at compile time (to the mesh COM)
+            # and stores the applied transform in mesh_pos/mesh_quat. geom_pos/
+            # geom_quat are relative to that *recentered* frame, so a viewer that
+            # loads the raw STL must undo this offset (see yam/web/app.js).
+            entry["mesh_pos"] = [float(x) for x in model.mesh_pos[mid]]
+            entry["mesh_quat"] = [float(x) for x in model.mesh_quat[mid]]  # wxyz
+            meshes_used.add(mesh_file)
         geoms.append(entry)
 
+    if description is None:
+        description = TASKS[task]["description"]
     return {
         "task": task,
-        "description": TASKS[task]["description"],
+        "description": description,
         "nbody": int(model.nbody),
         "bodies": bodies,
         "geoms": geoms,
@@ -219,13 +347,56 @@ def scene_manifest(model, task, include_groups=(0, 1, 2)):
     }
 
 
-def export_web(task="pick_cube", out_dir=None):
-    """Write ``<out>/<task>/manifest.json`` and copy the STL meshes it needs
-    into ``<out>/meshes/`` for the three.js viewer."""
+EMBODIMENT_SEP = "__"
+
+
+def embodiment_task_id(task, key):
+    """Viewer id for a (task, arm) pair, e.g. ``pick_cube__ur5e``. Plain
+    ``pick_cube`` stays YAM so existing links and saved sessions keep working.
+
+    The separator doubles as a URL path segment and a directory name, so it
+    avoids characters the static file handler would have to percent-decode.
+    Task names use single underscores only, so the split is unambiguous.
+    """
+    return task if key == "yam" else f"{task}{EMBODIMENT_SEP}{key}"
+
+
+def export_embodiment_web(key, task="pick_cube", out_dir=None):
+    """Build a task scene for one arm and write everything the viewer needs.
+
+    The viewer is otherwise YAM-only: it reads a manifest plus STL meshes that
+    were copied out of ``yam/assets/yam/assets``. Other arms live in Menagerie,
+    ship ``.obj`` as often as ``.stl``, and reuse mesh names like ``base_link``
+    across vendors -- so the meshes are regenerated from the compiled model and
+    namespaced per arm.
+    """
+    from . import embodiments as E
+    from . import scene as S
+
+    emb = E.REGISTRY[key]
+    model, info = S.build(emb, task=task)
     if out_dir is None:
         out_dir = os.path.join(os.path.dirname(__file__), "web", "public", "model")
-    model = load_model(task)
-    manifest = scene_manifest(model, task)
+
+    files = export_model_meshes(model, os.path.join(out_dir, "meshes"),
+                                prefix=f"{key}__")
+    label = embodiment_task_id(task, key)
+    desc = (f"{TASKS[task]['description']} -- {key} "
+            f"({emb.dof} DOF, {info['reach']:.2f} m reach)")
+    manifest = scene_manifest(model, task, description=desc, mesh_files=files)
+    manifest["task"] = label
+    manifest["embodiment"] = key
+    export_manifest(manifest, out_dir, copy_meshes=False)
+    return label
+
+
+def export_manifest(manifest, out_dir=None, copy_meshes=True):
+    """Write ``<out>/<task>/manifest.json``, copy the STL meshes it references
+    into ``<out>/meshes/``, and register the task in ``<out>/index.json``. Works
+    for any manifest built by ``scene_manifest`` (single-arm or bimanual)."""
+    if out_dir is None:
+        out_dir = os.path.join(os.path.dirname(__file__), "web", "public", "model")
+    task = manifest["task"]
 
     task_dir = os.path.join(out_dir, task)
     mesh_dir = os.path.join(out_dir, "meshes")
@@ -236,11 +407,12 @@ def export_web(task="pick_cube", out_dir=None):
     with open(os.path.join(task_dir, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
 
-    src_mesh_dir = os.path.join(ASSETS_DIR, "assets")
-    for mesh in manifest["meshes"]:
-        src = os.path.join(src_mesh_dir, mesh)
-        if os.path.exists(src):
-            shutil.copyfile(src, os.path.join(mesh_dir, mesh))
+    if copy_meshes:
+        src_mesh_dir = os.path.join(ASSETS_DIR, "assets")
+        for mesh in manifest["meshes"]:
+            src = os.path.join(src_mesh_dir, mesh)
+            if os.path.exists(src):
+                shutil.copyfile(src, os.path.join(mesh_dir, mesh))
 
     # A tiny index so the client can discover available tasks.
     index_path = os.path.join(out_dir, "index.json")
@@ -252,13 +424,20 @@ def export_web(task="pick_cube", out_dir=None):
             pass
     tasks = {t["task"]: t for t in index.get("tasks", [])}
     tasks[task] = {"task": task, "manifest": f"{task}/manifest.json",
-                   "description": TASKS[task]["description"]}
+                   "description": manifest["description"]}
     index["tasks"] = sorted(tasks.values(), key=lambda t: t["task"])
     with open(index_path, "w") as f:
         json.dump(index, f, indent=2)
 
     print(f"[yam.model] exported manifest + {len(manifest['meshes'])} meshes to {task_dir}")
     return task_dir
+
+
+def export_web(task="pick_cube", out_dir=None):
+    """Single-arm web export: build the task manifest and write it."""
+    model = load_model(task)
+    manifest = scene_manifest(model, task)
+    return export_manifest(manifest, out_dir)
 
 
 def _cli():

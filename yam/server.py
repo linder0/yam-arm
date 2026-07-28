@@ -23,6 +23,8 @@ import time
 
 import numpy as np
 
+from . import bimanual as B
+from . import embodiments as E
 from . import model as M
 from .env import YamEnv
 from .teleop import EEController, scripted_expert
@@ -55,7 +57,11 @@ class SimSession:
 
     # -- lifecycle -----------------------------------------------------------
     def set_task(self, task):
-        if task not in M.TASKS:
+        # Viewer ids are "<task>" (YAM) or "<task>__<arm>", so one dropdown
+        # switches both the task and the embodiment.
+        task, _, key = task.partition(M.EMBODIMENT_SEP)
+        key = key or "yam"
+        if task not in M.TASKS or key not in E.REGISTRY:
             return
         if self.env is not None:
             self.env.close()
@@ -63,7 +69,10 @@ class SimSession:
         self.env = YamEnv(task=task, seed=int(time.time()) % 10000,
                           render_cameras=render,
                           cam_height=max(self.cam_size, 1),
-                          cam_width=max(self.cam_size, 1))
+                          cam_width=max(self.cam_size, 1),
+                          embodiment=key)
+        self.embodiment = key
+        self.task_id = M.embodiment_task_id(task, key)
         self.ctl = EEController(self.env)
         self.last_obs = self.env.reset()
         self.ctl.reset()
@@ -152,7 +161,9 @@ class SimSession:
         xpos, xquat = self.env.body_states()
         return {
             "type": "state",
-            "task": self.env.task,
+            # The viewer keys its mounted scene off this, so it must be the
+            # embodiment-qualified id or a UR5e stream drives YAM geometry.
+            "task": getattr(self, "task_id", self.env.task),
             "mode": self.mode,
             "step": int(self.last_info.get("steps", 0)),
             "success": bool(self.last_info.get("success", False)),
@@ -305,8 +316,13 @@ async def _ws_session(reader, writer, headers, make_session):
     writer.write(handshake.encode())
     await writer.drain()
 
-    session = make_session()
+    # Sessions live behind a mutable holder so a task switch can swap a
+    # single-arm SimSession <-> a two-arm BimanualSession at runtime.
+    holder = {"s": make_session(None)}
     connected = {"ok": True}
+
+    def _is_bimanual(sess):
+        return isinstance(sess, B.BimanualSession)
 
     async def reader_loop():
         while connected["ok"]:
@@ -319,16 +335,34 @@ async def _ws_session(reader, writer, headers, make_session):
                 continue
             if opcode == 0x1 and payload:
                 try:
-                    session.on_control(json.loads(payload.decode("utf-8")))
+                    msg = json.loads(payload.decode("utf-8"))
                 except Exception as e:
                     print("[yam.server] bad control msg:", e)
+                    continue
+                # A task that crosses the single/bimanual boundary needs a fresh
+                # session of the other type (they are deliberately separate).
+                if msg.get("cmd") == "task":
+                    t = msg.get("task")
+                    want_bi = t in B.BIMANUAL_TASKS
+                    if t and want_bi != _is_bimanual(holder["s"]):
+                        holder["s"].close()
+                        holder["s"] = make_session(t)
+                        continue
+                try:
+                    holder["s"].on_control(msg)
+                except Exception as e:
+                    print("[yam.server] control error:", e)
 
     async def stream_loop():
-        # Tell the client which task/manifest to load first.
+        # Tell the client which task/manifest to load first, and both task sets.
+        s = holder["s"]
         await ws_send(writer, json.dumps({"type": "hello",
-                      "task": session.env.task, "tasks": sorted(M.TASKS)}))
+                      "task": getattr(s, "task_id", s.env.task),
+                      "tasks": viewer_task_ids(),
+                      "bimanual_tasks": sorted(B.BIMANUAL_TASKS)}))
         while connected["ok"]:
             t0 = time.perf_counter()
+            session = holder["s"]
             if session.mode != "idle":
                 session.step()
             try:
@@ -344,12 +378,15 @@ async def _ws_session(reader, writer, headers, make_session):
         await asyncio.gather(reader_loop(), stream_loop())
     finally:
         connected["ok"] = False
-        session.close()
+        holder["s"].close()
 
 
 async def _serve(host, port, task, cam_size, action_fn):
-    def make_session():
-        return SimSession(task=task, cam_size=cam_size, action_fn=action_fn)
+    def make_session(t):
+        t = t or task
+        if t in B.BIMANUAL_TASKS:
+            return B.BimanualSession(task=t)
+        return SimSession(task=t, cam_size=cam_size, action_fn=action_fn)
 
     server = await asyncio.start_server(
         lambda r, w: _handle(r, w, make_session), host, port)
@@ -361,13 +398,36 @@ async def _serve(host, port, task, cam_size, action_fn):
         await server.serve_forever()
 
 
+def viewer_task_ids():
+    """Every (task, arm) pair the dropdown can offer, YAM first and unqualified
+    so existing links keep resolving."""
+    ids = sorted(M.TASKS)
+    for key in E.REGISTRY:
+        if key == "yam":
+            continue
+        ids += [M.embodiment_task_id(t, key) for t in sorted(M.TASKS)]
+    return ids
+
+
 def run(host="127.0.0.1", port=8080, task="pick_cube", cam_size=0,
-        action_fn=None, export_web=True):
+        action_fn=None, export_web=True, embodiments=True):
     if export_web:
         print("[yam.server] exporting web assets (manifests + meshes) ...",
               flush=True)
         for t in M.TASKS:
             M.export_web(t)
+        for t in B.BIMANUAL_TASKS:
+            B.export_web(t)
+        if embodiments:
+            for key in E.REGISTRY:
+                if key == "yam":
+                    continue
+                for t in M.TASKS:
+                    try:
+                        M.export_embodiment_web(key, t)
+                    except Exception as e:
+                        print(f"[yam.server] skipped {t}@{key}: "
+                              f"{type(e).__name__}: {e}")
     try:
         asyncio.run(_serve(host, port, task, cam_size, action_fn))
     except KeyboardInterrupt:
