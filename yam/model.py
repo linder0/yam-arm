@@ -434,10 +434,14 @@ def export_manifest(manifest, out_dir=None, copy_meshes=True):
 
 
 def export_web(task="pick_cube", out_dir=None):
-    """Single-arm web export: build the task manifest and write it."""
-    model = load_model(task)
-    manifest = scene_manifest(model, task)
-    return export_manifest(manifest, out_dir)
+    """Single-arm web export.
+
+    Exports the *composed* scene, which is what the env actually simulates and
+    streams. The static ``pick_cube.xml`` has the same bodies but declares the
+    cube and target last, whereas the composer adds them before the arm -- so a
+    manifest built from the XML draws every link at another body's pose.
+    """
+    return export_embodiment_web("yam", task, out_dir)
 
 
 def _cli():
