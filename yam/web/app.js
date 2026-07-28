@@ -191,12 +191,19 @@ function connect() {
   ws.onmessage = (ev) => onMessage(JSON.parse(ev.data));
 }
 
+// The server names scenes "<task>" (YAM) or "<task>__<arm>". Split that into
+// two dropdowns: a task list that stays short however many arms exist, and an
+// arm list beside it.
+const ARM_SEP = "__";
 let singleTasks = [];
 let bimanualTasks = [];
+let armList = [];
 
-function populateTasks(twoArms, select = null) {
-  const sel = document.getElementById("task");
-  const list = twoArms ? bimanualTasks : singleTasks;
+const baseOf = (id) => id.split(ARM_SEP)[0];
+const armOf = (id) => (id.includes(ARM_SEP) ? id.split(ARM_SEP)[1] : "yam");
+const taskId = (base, arm) => (arm === "yam" ? base : `${base}${ARM_SEP}${arm}`);
+
+function fill(sel, list, select) {
   sel.innerHTML = "";
   for (const t of list) {
     const o = document.createElement("option");
@@ -206,16 +213,43 @@ function populateTasks(twoArms, select = null) {
   return sel.value;
 }
 
+function populateTasks(twoArms, select = null) {
+  const list = twoArms ? bimanualTasks
+                       : [...new Set(singleTasks.map(baseOf))];
+  const value = fill(document.getElementById("task"), list,
+                     twoArms ? select : select && baseOf(select));
+  // Two-arm scenes are YAM-only, and a single-arm server has nothing to pick.
+  const hide = twoArms || armList.length <= 1;
+  document.getElementById("arm").hidden = hide;
+  document.getElementById("armlabel").hidden = hide;
+  return value;
+}
+
+function populateArms(select = null) {
+  return fill(document.getElementById("arm"), armList, select);
+}
+
+/** The scene id the two dropdowns currently describe. */
+function selectedTask() {
+  if (document.getElementById("twoarms").checked) {
+    return document.getElementById("task").value;
+  }
+  return taskId(document.getElementById("task").value,
+                document.getElementById("arm").value);
+}
+
 async function onMessage(msg) {
   if (msg.type === "hello") {
     singleTasks = msg.tasks || [];
     bimanualTasks = msg.bimanual_tasks || [];
+    armList = [...new Set(["yam", ...singleTasks.map(armOf)])];
     const twoArms = bimanualTasks.includes(msg.task);
     const twoArmsBox = document.getElementById("twoarms");
     twoArmsBox.checked = twoArms;
     // Servers without two-arm tasks ignore the toggle -- hide it rather than
     // let a click empty the task list and do nothing.
     twoArmsBox.closest("label").hidden = bimanualTasks.length === 0;
+    populateArms(armOf(msg.task));
     populateTasks(twoArms, msg.task);
     if (msg.sessions !== undefined) {  // agent server: session save/replay UI
       document.getElementById("sessionsui").hidden = false;
@@ -518,11 +552,15 @@ function switchTask(task) {
   send({ cmd: "mode", mode: currentMode() });
   // The scene is (re)loaded by the state stream once the server switches task.
 }
-document.getElementById("task").addEventListener("change", (e) => {
-  switchTask(e.target.value);
+document.getElementById("task").addEventListener("change", () => {
+  switchTask(selectedTask());
+});
+document.getElementById("arm").addEventListener("change", () => {
+  switchTask(selectedTask());
 });
 document.getElementById("twoarms").addEventListener("change", (e) => {
-  switchTask(populateTasks(e.target.checked));
+  populateTasks(e.target.checked);
+  switchTask(selectedTask());
 });
 document.querySelectorAll("#modes button").forEach((b) => {
   b.addEventListener("click", () => {
