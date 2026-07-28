@@ -439,7 +439,10 @@ def _cli():
     p = argparse.ArgumentParser(description="YAM live viewer server")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8080)
-    p.add_argument("--task", default="pick_cube", choices=sorted(M.TASKS))
+    p.add_argument("--task", default="pick_cube", metavar="TASK[__ARM]",
+                   choices=viewer_task_ids() + sorted(B.BIMANUAL_TASKS),
+                   help="scene to open, e.g. pick_cube or pick_cube__ur5e "
+                        f"(arms: {', '.join(E.REGISTRY)})")
     p.add_argument("--cam-size", type=int, default=0,
                    help="camera render size (0 = off; needed only to record "
                         "teleop demos through the browser)")
