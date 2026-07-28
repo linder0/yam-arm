@@ -1,0 +1,24 @@
+# YAM arm imitation-learning stack. Install into its own venv:
+#
+#   python3.12 -m venv .venv-yam && source .venv-yam/bin/activate
+#   pip install -r requirements.txt
+#
+# The live 3-D viewer (yam/web) needs NO Node/npm build -- it loads three.js
+# from a CDN and is served by the pure-stdlib websocket server (yam/server.py).
+
+# --- core sim + viewer + data collection (runnable on a laptop, no GPU) ------
+mujoco>=3.1.3          # physics + offscreen camera rendering (YAM model needs 3.1.3+)
+numpy>=1.24
+imageio>=2.30          # eval videos; dataset image handling
+imageio-ffmpeg>=0.4    # MP4 encoding for eval videos and LeRobot video frames
+
+# --- robot IDE chat pane (optional): drives the arm from the browser via a
+#     Cursor agent. Needs CURSOR_API_KEY in the server env. ------------------
+cursor-sdk>=0.1        # Cursor SDK (python) for the chat agent (yam/chat.py)
+
+# --- imitation-learning training stack (heavier; needed for train.py/eval.py
+#     with a trained policy). Records native LeRobotDataset when installed. -----
+# Pin to a known-good LeRobot; the API moves fast (see record.py/eval.py which
+# adapt to it). Bring your own CUDA-enabled torch on a GPU box.
+lerobot>=0.1           # ACT / Diffusion Policy training + LeRobotDataset (parquet+mp4)
+torch>=2.2             # policy networks (install the CUDA build on a GPU)

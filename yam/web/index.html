@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>YAM arm — live viewer</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; background: #0d1117; color: #e6edf3;
+      font: 13px/1.5 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+    #app { position: fixed; inset: 0; }
+    #scene { position: absolute; inset: 0; }
+    #panel { position: absolute; top: 12px; left: 12px; width: 260px;
+      background: rgba(22,27,34,0.92); border: 1px solid #30363d; border-radius: 10px;
+      padding: 14px; backdrop-filter: blur(6px); }
+    #panel h1 { font-size: 14px; margin: 0 0 2px; letter-spacing: .3px;
+      display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+    #panel .sub { color: #8b949e; font-size: 11px; margin-bottom: 12px; }
+    #status { font-size: 10px; font-weight: 400; color: #f85149; white-space: nowrap; }
+    #status.ok { color: #3fb950; }
+    .row { display: flex; gap: 6px; margin-bottom: 8px; flex-wrap: wrap; }
+    label { color: #8b949e; font-size: 11px; display: block; margin: 8px 0 3px; }
+    button, select { background: #21262d; color: #e6edf3; border: 1px solid #30363d;
+      border-radius: 7px; padding: 6px 10px; cursor: pointer; font-size: 12px; }
+    button:hover { border-color: #58a6ff; }
+    button.active { background: #1f6feb; border-color: #1f6feb; }
+    button.rec { background: #da3633; border-color: #da3633; }
+    select { width: 100%; }
+    input[type=range] { width: 100%; }
+    .stat { display: flex; justify-content: space-between; font-size: 11px;
+      color: #8b949e; padding: 2px 0; }
+    .stat b { color: #e6edf3; font-weight: 600; }
+    .ok { color: #3fb950; }
+    #hint { position: absolute; bottom: 12px; left: 12px; color: #6e7681;
+      font-size: 11px; max-width: 340px; }
+    #handview { position: absolute; bottom: 12px; right: 372px; width: 280px;
+      border: 1px solid #30363d; border-radius: 10px; transform: scaleX(1); }
+    #handstatus { color: #8b949e; font-size: 11px; min-height: 14px; margin-top: 2px; }
+    #fullscreen { position: absolute; top: 12px; right: 372px; width: 32px;
+      height: 32px; padding: 0; font-size: 15px; line-height: 1;
+      background: rgba(22,27,34,0.92); backdrop-filter: blur(6px); }
+    /* Fullscreen: hide the panes but keep the hand-tracking camera visible. */
+    body.fs #panel, body.fs #agentpane, body.fs #hint { display: none; }
+    body.fs #fullscreen { right: 12px; }
+    body.fs #handview { right: 12px; }
+
+    /* Agent pane: one Cursor-style conversation -- user messages as cards,
+       chain of thought as dimmed text, tool calls as compact expandable rows,
+       camera captures inline, assistant replies as plain prose. */
+    #agentpane { position: absolute; top: 12px; right: 12px; bottom: 12px; width: 348px;
+      background: rgba(22,27,34,0.96); border: 1px solid #30363d; border-radius: 10px;
+      backdrop-filter: blur(6px); display: flex; flex-direction: column; }
+    #agentpane header { padding: 12px 14px 8px; border-bottom: 1px solid #30363d; }
+    #agentpane h1 { font-size: 14px; margin: 0 0 2px; letter-spacing: .3px; }
+    #activity { color: #8b949e; font-size: 11px; min-height: 15px; }
+    #activity.live { color: #d29922; }
+    #sessionsui .row { margin: 6px 0 0; }
+    #sessionsui select { width: 100%; }
+
+    #convo { flex: 1; overflow-y: auto; padding: 12px 14px;
+      display: flex; flex-direction: column; gap: 10px; }
+
+    .msg-user { background: #21262d; border: 1px solid #30363d;
+      border-radius: 8px; padding: 7px 10px; font-size: 12.5px;
+      white-space: pre-wrap; word-break: break-word; }
+    .msg-assistant { color: #e6edf3; font-size: 12.5px; line-height: 1.55;
+      word-break: break-word; padding: 0 2px; }
+    .msg-assistant code, .msg-user code { background: #343942;
+      border-radius: 4px; padding: 0 4px; font-size: 11px;
+      font-family: ui-monospace, SFMono-Regular, monospace; }
+    .msg-system { color: #8b949e; font-size: 10.5px; font-style: italic;
+      text-align: center; padding: 0 6px; }
+
+    .thought { color: #768390; font-size: 11.5px; font-style: italic;
+      line-height: 1.5; padding: 1px 0 1px 10px;
+      border-left: 2px solid #373e47; word-break: break-word; }
+
+    details.tool { font-size: 11px; }
+    details.tool summary { list-style: none; display: flex; align-items: baseline;
+      gap: 6px; cursor: pointer; color: #8b949e; border-radius: 6px;
+      padding: 2px 6px; font-family: ui-monospace, SFMono-Regular, monospace; }
+    details.tool summary::-webkit-details-marker { display: none; }
+    details.tool summary:hover { background: #21262d; }
+    details.tool .glyph { color: #3fb950; font-size: 8px; }
+    details.tool.read .glyph { color: #6e7681; }
+    details.tool.err .glyph { color: #f85149; }
+    details.tool .tname { color: #adbac7; }
+    details.tool.err .tname { color: #ff7b72; }
+    details.tool .targs { color: #6e7681; overflow: hidden;
+      text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+    details.tool .tmeta { color: #545d68; font-size: 10px; white-space: nowrap; }
+    details.tool pre { margin: 3px 0 3px 20px; white-space: pre-wrap;
+      word-break: break-word; color: #768390; font-size: 10px;
+      font-family: ui-monospace, SFMono-Regular, monospace;
+      border-left: 2px solid #373e47; padding-left: 8px; }
+
+    .capture .cap { color: #768390; font-size: 10.5px; margin-bottom: 3px;
+      font-family: ui-monospace, SFMono-Regular, monospace; }
+    .capture img { width: 72%; border-radius: 6px; border: 1px solid #30363d;
+      image-rendering: pixelated; display: block; }
+
+    .divider { text-align: center; color: #8b949e; font-size: 10px;
+      letter-spacing: .4px; border: 1px dashed #30363d; border-radius: 8px;
+      padding: 4px 8px; }
+
+    #chattyping { display: none; color: #8b949e; font-size: 11px;
+      padding: 0 2px; }
+    #chattyping.on { display: block; }
+    @keyframes pulse { 50% { opacity: 0.45; } }
+    #chattyping.on { animation: pulse 1.6s ease-in-out infinite; }
+
+    #chatform { display: flex; gap: 6px; padding: 10px;
+      border-top: 1px solid #30363d; }
+    #chatinput { flex: 1; background: #0d1117; border: 1px solid #30363d;
+      border-radius: 8px; color: #e6edf3; padding: 7px 10px; font-size: 12px; }
+    #chatinput:focus { outline: none; border-color: #58a6ff; }
+  </style>
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <div id="app">
+    <div id="scene"></div>
+    <div id="panel">
+      <h1>YAM arm — live viewer <span id="status">connecting…</span></h1>
+      <div class="sub" id="desc">–</div>
+
+      <!-- Manual sim controls: autopilot / teleop / hand tracking / demo
+           recording. Live on every server; on the agent IDE they share the
+           sim with the agent (an agent tool call takes over -> mode idle,
+           picking a mode takes control back). -->
+      <div id="simcontrols">
+        <label style="display:flex; align-items:center; gap:6px; margin-top:4px">
+          <input type="checkbox" id="twoarms" style="width:auto; margin:0" />
+          Two arms
+        </label>
+
+        <label>Task</label>
+        <select id="task"></select>
+
+        <label>Mode</label>
+        <div class="row" id="modes">
+          <button data-mode="scripted">Autopilot</button>
+          <button data-mode="teleop">Teleop</button>
+          <button data-mode="idle">Idle</button>
+        </div>
+
+        <div class="row">
+          <button id="reset">Reset</button>
+          <button id="grip">Toggle grip</button>
+        </div>
+
+        <label>Hand teleop (MediaPipe)</label>
+        <div class="row">
+          <button id="hand">Enable hand tracking</button>
+        </div>
+        <div id="handstatus"></div>
+
+        <label>Speed <span id="speedval">1.0×</span></label>
+        <input type="range" id="speed" min="0.2" max="3" step="0.1" value="1" />
+
+        <label>Record teleop demo</label>
+        <div class="row">
+          <button id="recstart">● Record</button>
+          <button id="recstop">Save</button>
+        </div>
+      </div>
+      <div style="margin-top:10px; border-top:1px solid #30363d; padding-top:8px">
+        <div class="stat"><span>mode</span><b id="s-mode">–</b></div>
+        <div class="stat"><span>step</span><b id="s-step">0</b></div>
+        <div class="stat"><span>success</span><b id="s-success">–</b></div>
+        <div class="stat"><span>recording</span><b id="s-rec">off</b></div>
+      </div>
+    </div>
+    <div id="agentpane">
+      <header>
+        <h1>Agent activity</h1>
+        <div class="sub" style="margin-bottom:6px">chain of thought · tool calls · visual inputs</div>
+        <div id="activity">idle</div>
+        <div id="sessionsui" hidden>
+          <div class="row">
+            <select id="sessions"></select>
+          </div>
+          <div class="row">
+            <button id="replay">Replay</button>
+            <button id="replaystop">Stop</button>
+            <button id="savesession">Save session</button>
+          </div>
+        </div>
+      </header>
+      <div id="convo">
+        <div id="convo-empty" class="sub" style="margin:4px 2px">
+          No agent activity yet. Type a task below (or connect an LLM to the
+          <b>yam-arm</b> MCP server) — the conversation streams here: the
+          agent's reasoning, every tool call with arguments and results, and
+          each camera capture the moment it is taken.
+        </div>
+        <div id="chattyping">Working…</div>
+      </div>
+      <form id="chatform" hidden>
+        <input id="chatinput" placeholder="e.g. pick up the cube…"
+          autocomplete="off" />
+        <button type="submit" id="chatsend">Send</button>
+      </form>
+    </div>
+    <button id="fullscreen" title="Full screen (F)">⛶</button>
+    <canvas id="handview" width="640" height="480" hidden></canvas>
+    <div id="hint">
+      Teleop keys: <b>W/S</b> ±X · <b>A/D</b> ±Y · <b>Q/E</b> ±Z · <b>Space</b> grip.
+      Hand teleop: move your hand to steer, toward/away from the camera for
+      depth, <b>pinch</b> to close the gripper. In two-arm mode each hand
+      drives its own arm.
+      Two-arm keyboard: <b>1</b>/<b>2</b> pick left/right arm to teleop.
+      Autopilot runs the scripted expert. Drag to orbit, scroll to zoom.
+      <b>F</b> toggles full screen (hides the panes).
+    </div>
+  </div>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

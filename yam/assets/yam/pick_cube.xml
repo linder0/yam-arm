@@ -1,0 +1,55 @@
+<mujoco model="yam_pick_cube">
+  <!-- Pick-and-place task scene: the vendored YAM arm on a tabletop, a cube to
+       grasp, and a target zone to place it in. Included (not standalone) so the
+       arm's compiler meshdir="assets" keeps resolving; hence this file lives
+       next to yam.xml. Added bodies use free/no joints only, so nq = arm(8) +
+       cube(7). Home arm pose is applied from code (yam.model.HOME_QPOS_ARM). -->
+  <include file="yam.xml"/>
+
+  <statistic center="0.3 0 0.15" extent="1.0"/>
+
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.35 0.35 0.35" specular="0 0 0"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+    <global azimuth="140" elevation="-20"/>
+  </visual>
+
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="3072"/>
+    <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3"
+      markrgb="0.8 0.8 0.8" width="300" height="300"/>
+    <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2"/>
+    <material name="tabletop" rgba="0.55 0.45 0.35 1"/>
+    <material name="cube_mat" rgba="0.85 0.2 0.2 1"/>
+    <material name="target_mat" rgba="0.2 0.8 0.3 0.35"/>
+  </asset>
+
+  <worldbody>
+    <light pos="0.3 0 1.5" dir="0 0 -1" directional="true"/>
+    <geom name="floor" size="0 0 0.05" type="plane" material="groundplane" pos="0 0 -0.4" contype="1" conaffinity="1"/>
+
+    <!-- Table: top surface at z = 0, so the arm base sits on it. -->
+    <geom name="table" type="box" material="tabletop" pos="0.3 0 -0.02" size="0.45 0.5 0.02"
+      contype="1" conaffinity="1"/>
+
+    <!-- Cube to manipulate (free joint => 7 qpos appended after the arm). -->
+    <body name="cube" pos="0.4 0.0 0.025">
+      <freejoint name="cube_free"/>
+      <inertial pos="0 0 0" mass="0.05" diaginertia="2.1e-5 2.1e-5 2.1e-5"/>
+      <geom name="cube_geom" type="box" size="0.025 0.025 0.025" material="cube_mat"
+        condim="4" friction="1.0 0.05 0.01" contype="1" conaffinity="1"/>
+    </body>
+
+    <!-- Target zone: a flat translucent disk the cube must be placed onto. Pure
+         visual/marker (no collision); success is computed in code. -->
+    <body name="target" pos="0.4 0.28 0.001" mocap="true">
+      <geom name="target_geom" type="cylinder" size="0.06 0.001" material="target_mat"
+        contype="0" conaffinity="0"/>
+    </body>
+
+    <!-- Fixed exterior + top-down cameras for image observations. -->
+    <camera name="front" pos="0.95 0 0.5" xyaxes="0 1 0 -0.6 0 0.8" fovy="58"/>
+    <camera name="top" pos="0.35 0 0.85" xyaxes="1 0 0 0 1 0" fovy="55"/>
+    <camera name="side" pos="0.35 0.95 0.45" xyaxes="-1 0 0 0 -0.5 0.85" fovy="58"/>
+  </worldbody>
+</mujoco>
